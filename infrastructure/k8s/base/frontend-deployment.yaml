@@ -16,12 +16,9 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: acrportfoliocicddev.azurecr.io/frontend:latest
+        image: acrportfoliocicddev.azurecr.io/frontend:v1.0
         ports:
         - containerPort: 80
-        env:
-        - name: REACT_APP_API_URL
-          value: "http://backend:3001"
         resources:
           requests:
             memory: "128Mi"
