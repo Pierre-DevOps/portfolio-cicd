@@ -1,0 +1,106 @@
+name: CD Deploy to Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  ACR_NAME: acrportfoliocicddev
+  AKS_CLUSTER: aks-portfoliocicd-dev
+  RESOURCE_GROUP: rg-portfoliocicd-dev
+
+jobs:
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform plan
+
+      - name: Terraform Apply
+        if: github.event.inputs.environment == 'dev'
+        working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform apply -auto-approve
+
+  build-and-push:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build and push backend
+        working-directory: ./backend
+        run: |
+          docker build -t ${{ env.ACR_NAME }}.azurecr.io/backend:${{ github.sha }} .
+          docker push ${{ env.ACR_NAME }}.azurecr.io/backend:${{ github.sha }}
+
+      - name: Build and push frontend
+        working-directory: ./frontend
+        run: |
+          docker build -t ${{ env.ACR_NAME }}.azurecr.io/frontend:${{ github.sha }} .
+          docker push ${{ env.ACR_NAME }}.azurecr.io/frontend:${{ github.sha }}
+
+      - name: Scan images with Trivy
+        run: |
+          docker run --rm aquasec/trivy image ${{ env.ACR_NAME }}.azurecr.io/backend:${{ github.sha }}
+          docker run --rm aquasec/trivy image ${{ env.ACR_NAME }}.azurecr.io/frontend:${{ github.sha }}
+
+  deploy-to-aks:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_CLUSTER }} --overwrite-existing
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f infrastructure/k8s/base/
+          kubectl set image deployment/backend backend=${{ env.ACR_NAME }}.azurecr.io/backend:${{ github.sha }}
+          kubectl set image deployment/frontend frontend=${{ env.ACR_NAME }}.azurecr.io/frontend:${{ github.sha }}
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/backend
+          kubectl rollout status deployment/frontend
