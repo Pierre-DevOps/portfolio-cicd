@@ -1,0 +1,149 @@
+name: Deploy to Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AZURE_RESOURCE_GROUP: rg-portfoliocicd-${{ github.event.inputs.environment }}
+  ACR_NAME: acrportfoliocicd${{ github.event.inputs.environment }}
+  AKS_CLUSTER: aks-portfoliocicd-${{ github.event.inputs.environment }}
+  LOCATION: switzerlandnorth
+
+jobs:
+  deploy-infrastructure:
+    name: Deploy Infrastructure with Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      acr_name: ${{ steps.terraform.outputs.acr_name }}
+      aks_name: ${{ steps.terraform.outputs.aks_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: terraform
+        working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          echo "acr_name=$(terraform output -raw acr_name)" >> $GITHUB_OUTPUT
+          echo "aks_name=$(terraform output -raw aks_name)" >> $GITHUB_OUTPUT
+
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build and Push Backend
+        run: |
+          az acr build --registry ${{ env.ACR_NAME }} \
+            --image backend:${{ github.sha }} \
+            --image backend:latest \
+            ./backend
+
+      - name: Build and Push Frontend
+        run: |
+          az acr build --registry ${{ env.ACR_NAME }} \
+            --image frontend:${{ github.sha }} \
+            --image frontend:latest \
+            ./frontend
+
+      - name: Scan Backend Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.ACR_NAME }}.azurecr.io/backend:latest'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Scan Frontend Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.ACR_NAME }}.azurecr.io/frontend:latest'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+  deploy-to-kubernetes:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    needs: [deploy-infrastructure, build-and-push]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER }} \
+            --overwrite-existing
+
+      - name: Update Image Tags in Manifests
+        run: |
+          sed -i 's|acrportfoliocicddev.azurecr.io/backend:.*|${{ env.ACR_NAME }}.azurecr.io/backend:${{ github.sha }}|g' infrastructure/k8s/base/backend-deployment.yaml
+          sed -i 's|acrportfoliocicddev.azurecr.io/frontend:.*|${{ env.ACR_NAME }}.azurecr.io/frontend:${{ github.sha }}|g' infrastructure/k8s/base/frontend-deployment.yaml
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f infrastructure/k8s/base/backend-deployment.yaml
+          kubectl apply -f infrastructure/k8s/base/frontend-deployment.yaml
+
+      - name: Wait for Rollout
+        run: |
+          kubectl rollout status deployment/backend --timeout=5m
+          kubectl rollout status deployment/frontend --timeout=5m
+
+      - name: Get Service URLs
+        run: |
+          echo "Backend Service:"
+          kubectl get service backend
+          echo "Frontend Service:"
+          kubectl get service frontend
+          EXTERNAL_IP=$(kubectl get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Application URL: http://$EXTERNAL_IP"
