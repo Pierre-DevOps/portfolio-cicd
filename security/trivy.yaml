@@ -1,0 +1,11 @@
+# Configuration Trivy pour scan de sécurité
+severity:
+  - CRITICAL
+  - HIGH
+  - MEDIUM
+
+ignore-unfixed: false
+exit-code: 1
+
+format: json
+output: trivy-results.json

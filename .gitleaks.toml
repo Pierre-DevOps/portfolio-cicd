@@ -1,0 +1,17 @@
+title = "Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist pour les faux positifs"
+paths = [
+  '''node_modules/''',
+  '''\.terraform/'''
+]
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic API Key"
+regex = '''(?i)(api[_-]?key|apikey|api[_-]?secret)(.{0,20})?['"][0-9a-zA-Z]{16,45}['"]'''
+tags = ["key", "API"]
