@@ -40,7 +40,11 @@ jobs:
 
       - name: Terraform Plan
         working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
-        run: terraform plan -out=tfplan
+        run: |
+          terraform plan -out=tfplan \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -var="location=switzerlandnorth" \
+            -var="project_name=portfoliocicd"
 
       - name: Terraform Apply
         working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
@@ -114,6 +118,7 @@ jobs:
       - name: Get Application URL
         run: |
           echo "Waiting for LoadBalancer IP..."
-          sleep 30
+          sleep 60
           EXTERNAL_IP=$(kubectl get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          echo "::notice::Application deployed at http://$EXTERNAL_IP"
+          echo "Application deployed at http://$EXTERNAL_IP"
+          echo "::notice::✅ Application disponible sur http://$EXTERNAL_IP"
