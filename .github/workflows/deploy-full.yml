@@ -9,8 +9,6 @@ on:
         type: choice
         options:
           - dev
-          - staging
-          - prod
 
 env:
   AZURE_RESOURCE_GROUP: rg-portfoliocicd-${{ github.event.inputs.environment }}
@@ -22,9 +20,6 @@ jobs:
   deploy-infrastructure:
     name: Deploy Infrastructure with Terraform
     runs-on: ubuntu-latest
-    outputs:
-      acr_name: ${{ steps.terraform.outputs.acr_name }}
-      aks_name: ${{ steps.terraform.outputs.aks_name }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -50,13 +45,6 @@ jobs:
       - name: Terraform Apply
         working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
         run: terraform apply -auto-approve tfplan
-
-      - name: Get Terraform Outputs
-        id: terraform
-        working-directory: ./infrastructure/terraform/environments/${{ github.event.inputs.environment }}
-        run: |
-          echo "acr_name=$(terraform output -raw acr_name)" >> $GITHUB_OUTPUT
-          echo "aks_name=$(terraform output -raw aks_name)" >> $GITHUB_OUTPUT
 
   build-and-push:
     name: Build and Push Docker Images
@@ -88,21 +76,10 @@ jobs:
             --image frontend:latest \
             ./frontend
 
-      - name: Scan Backend Image
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: '${{ env.ACR_NAME }}.azurecr.io/backend:latest'
-          format: 'table'
-          exit-code: '0'
-          severity: 'CRITICAL,HIGH'
-
-      - name: Scan Frontend Image
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: '${{ env.ACR_NAME }}.azurecr.io/frontend:latest'
-          format: 'table'
-          exit-code: '0'
-          severity: 'CRITICAL,HIGH'
+      - name: Scan Images with Trivy
+        run: |
+          docker run --rm aquasec/trivy image ${{ env.ACR_NAME }}.azurecr.io/backend:latest || true
+          docker run --rm aquasec/trivy image ${{ env.ACR_NAME }}.azurecr.io/frontend:latest || true
 
   deploy-to-kubernetes:
     name: Deploy to AKS
@@ -124,11 +101,6 @@ jobs:
             --name ${{ env.AKS_CLUSTER }} \
             --overwrite-existing
 
-      - name: Update Image Tags in Manifests
-        run: |
-          sed -i 's|acrportfoliocicddev.azurecr.io/backend:.*|${{ env.ACR_NAME }}.azurecr.io/backend:${{ github.sha }}|g' infrastructure/k8s/base/backend-deployment.yaml
-          sed -i 's|acrportfoliocicddev.azurecr.io/frontend:.*|${{ env.ACR_NAME }}.azurecr.io/frontend:${{ github.sha }}|g' infrastructure/k8s/base/frontend-deployment.yaml
-
       - name: Deploy to Kubernetes
         run: |
           kubectl apply -f infrastructure/k8s/base/backend-deployment.yaml
@@ -139,11 +111,9 @@ jobs:
           kubectl rollout status deployment/backend --timeout=5m
           kubectl rollout status deployment/frontend --timeout=5m
 
-      - name: Get Service URLs
+      - name: Get Application URL
         run: |
-          echo "Backend Service:"
-          kubectl get service backend
-          echo "Frontend Service:"
-          kubectl get service frontend
+          echo "Waiting for LoadBalancer IP..."
+          sleep 30
           EXTERNAL_IP=$(kubectl get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          echo "Application URL: http://$EXTERNAL_IP"
+          echo "::notice::Application deployed at http://$EXTERNAL_IP"
